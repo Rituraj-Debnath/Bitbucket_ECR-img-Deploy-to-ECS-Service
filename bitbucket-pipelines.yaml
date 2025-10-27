@@ -1,0 +1,62 @@
+image: node:20.11.0
+pipelines:
+  branches:
+    stage:
+      - step:
+          name: Build and Push Docker Image to ECR
+          services:
+            - docker
+          size: 2x
+          deployment: Staging
+          script:
+            - apt-get update && apt-get install -y awscli jq zip
+            - aws configure set aws_access_key_id $AWS_ID
+            - aws configure set aws_secret_access_key $AWS_KEY
+            - aws configure set default.region $AWS_DEFAULT_REGION
+            - export ECR_REPO="${BITBUCKET_BRANCH}/${BITBUCKET_REPO_SLUG}"
+            - export IMAGE_TAG="${BITBUCKET_BUILD_NUMBER}"
+            - export IMAGE_NAME="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG}"
+            - aws s3 cp s3://${S3BUCKET}/${BITBUCKET_REPO_SLUG}.env .env
+            - sed -i 's/HOST=localhost/HOST=0.0.0.0/' .env
+            - sed -i 's|^DATABASE_URL=.*|DATABASE_URL=mysql://admin:adminpgvibes_dstayz@pgvibes.cn084wcuasi2.ap-south-1.rds.amazonaws.com:3306/pgvibes|' .env
+            - cat .env
+            - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com
+            - docker build -t ${ECR_REPO}:${IMAGE_TAG} .
+            - docker tag ${ECR_REPO}:${IMAGE_TAG} ${IMAGE_NAME}
+            - docker push ${IMAGE_NAME}
+
+            # --- ECS Task Definition Update Steps ---
+            # Set your ECS cluster and service names below
+            - export CLUSTER_NAME=pgvibes-final
+            - export SERVICE_NAME=pgvibes-cx331-stage-service
+            - export TASK_FAMILY="pgvibes-cx331-stage"
+            # Get current task definition ARN
+            - TASK_DEF_ARN=$(aws ecs describe-services --cluster $CLUSTER_NAME --services $SERVICE_NAME --query "services[0].taskDefinition" --output text)
+            # Get current task definition JSON
+            - aws ecs describe-task-definition --task-definition $TASK_DEF_ARN > task-def.json
+            # Update image for specific containers: backend-stage and worker-stage
+            - |
+              cat task-def.json | jq \
+              --arg IMAGE "${IMAGE_NAME}" \
+              '.taskDefinition | {
+                family,
+                networkMode,
+                executionRoleArn,
+                taskRoleArn,
+                requiresCompatibilities,
+                cpu,
+                memory,
+                containerDefinitions: (
+                  .containerDefinitions | map(
+                    if (.name == "backend-stage" or .name == "worker-stage") then
+                      .image = $IMAGE
+                    else
+                      .
+                    end
+                  )
+                )
+              }' > new-task-def.json
+            # Register new revision
+            - NEW_TASK_DEF_ARN=$(aws ecs register-task-definition --cli-input-json file://new-task-def.json --query "taskDefinition.taskDefinitionArn" --output text)
+            # Update ECS service to use new revision
+            - aws ecs update-service --cluster $CLUSTER_NAME --service $SERVICE_NAME --task-definition $NEW_TASK_DEF_ARN --force-new-deployment
